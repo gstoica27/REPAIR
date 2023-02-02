@@ -54,7 +54,8 @@ def merge_hidden_conv(
     state_dict, prefix, a_conv, b_conv, 
     input_transform, output_transform, 
     recompute_output=False,
-    only_input_align=False
+    only_input_align=False,
+    ignore_mismatches=False
 ):
     O, I, H, W = a_conv.weight.shape
     get_I_by_O_by_HW = lambda x: x.permute(1, 0, 2, 3).flatten(2)
@@ -83,7 +84,28 @@ def merge_hidden_conv(
     output_transform[prefix] = ab_input_aligned
     if recompute_output:
         output_transform.compute_transform()
+    
     c_flat = output_transform.output_align @ ab_input_aligned
+    if ignore_mismatches:
+        a_input_aligned, b_input_aligned = ab_input_aligned.chunk(2, dim=0)
+        a_dims = a_input_aligned.any(dim=0, keepdim=True)
+        b_dims = b_input_aligned.any(dim=0, keepdim=True)
+        ab_dims = a_dims * b_dims
+        ab_input_aligned_valid = ab_input_aligned * ab_dims
+        
+#         a_only_valid = ab_input_aligned * (~ab_dims)
+#         remove_b = torch.ones((a_only_valid.shape[0], 1), device=a_dims.device) *2.
+#         remove_b[remove_b.shape[0]//2:] = 0.
+#         a_only_valid *= remove_b
+#         ab_input_aligned_valid += a_only_valid
+        
+        c_a, c_b = output_transform.output_align.chunk(2, dim=-1)
+        c_ab = ((c_a.sum(-1) * c_b.sum(-1)) != 0.)
+        c_flat[c_ab] = (output_transform.output_align @ ab_input_aligned_valid)[c_ab]
+#         print(f"{prefix} joint AB: {c_ab.sum()}/{c_ab.shape[0]}")
+#         if prefix == 'linear':
+#             import pdb; pdb.set_trace()
+        
     state_dict[prefix + '.weight'] = unflatten(c_flat, a_conv.weight.shape[-1])
     
     output_block_diagonal_ab = block_diagonalize_tensors(
@@ -101,7 +123,8 @@ def merge_linear(
     b_linear, input_transform, 
     output_transform, 
     recompute_output=False,
-    only_input_align=False
+    only_input_align=False,
+    ignore_mismatches=False
 ):
     class conv_wrapper:
         def __init__(self, linear):
@@ -112,7 +135,8 @@ def merge_linear(
             state_dict, prefix, conv_wrapper(a_linear), 
             conv_wrapper(b_linear), input_transform, 
             output_transform, recompute_output=recompute_output,
-            only_input_align=only_input_align
+            only_input_align=only_input_align,
+            ignore_mismatches=ignore_mismatches
         )
         state_dict[prefix + '.weight'] = c_w.flatten(1)
         state_dict[prefix + '.bias'] = concat_mats((a_linear.bias, b_linear.bias))
@@ -122,7 +146,8 @@ def merge_linear(
             state_dict, prefix, conv_wrapper(a_linear), 
             conv_wrapper(b_linear), input_transform, 
             output_transform, recompute_output=recompute_output,
-            only_input_align=only_input_align
+            only_input_align=only_input_align,
+            ignore_mismatches=ignore_mismatches
         )
         state_dict[prefix + '.weight'] = state_dict[prefix + '.weight'][..., 0, 0]
         state_dict[prefix + '.bias'] = output_transform.output_align @ concat_mats((a_linear.bias, b_linear.bias))
@@ -131,11 +156,13 @@ def merge_linear(
 def merge_block(
     state_dict, prefix, a_block, b_block, 
     input_transform, intra_transform,
-    output_transform=None, shortcut=False
+    output_transform=None, shortcut=False,
+    ignore_mismatches=False
 ):
     conv1_transform = merge_hidden_conv(
         state_dict, prefix + '.conv1', a_block.conv1, b_block.conv1, 
-        input_transform, intra_transform, recompute_output=True
+        input_transform, intra_transform, recompute_output=True,
+        ignore_mismatches=ignore_mismatches
     )
     merge_bn(state_dict, prefix + '.bn1', a_block.bn1, b_block.bn1, conv1_transform)
     
@@ -147,7 +174,8 @@ def merge_block(
         b_block.conv2, 
         conv1_transform,
         output_transform,
-        recompute_output=shortcut
+        recompute_output=shortcut,
+        ignore_mismatches=ignore_mismatches
     )
     merge_bn(state_dict, prefix + '.bn2', a_block.bn2, b_block.bn2, conv2_transform)
     
@@ -158,7 +186,8 @@ def merge_block(
             a_block.shortcut[0], 
             b_block.shortcut[0], 
             input_transform,
-            output_transform=conv2_transform
+            output_transform=conv2_transform,
+            ignore_mismatches=ignore_mismatches
         )
         merge_bn(
             state_dict, 
@@ -172,7 +201,7 @@ def merge_block(
 
 hard_pass = lambda : None
 
-def merge_resnet20(state_dict, a, b, transforms, concat_head=False):
+def merge_resnet20(state_dict, a, b, transforms, concat_head=False, ignore_mismatches=False):
     transforms['conv1'] = merge_first_convs(
         state_dict, 'conv1', a.conv1, b.conv1, 
         output_transform=transforms['conv1']
@@ -185,7 +214,8 @@ def merge_resnet20(state_dict, a, b, transforms, concat_head=False):
             input_transform=transforms['conv1'], 
             intra_transform=transforms[f'block1.{i}'],
             output_transform=transforms['conv1'],
-            shortcut=False
+            shortcut=False,
+            ignore_mismatches=ignore_mismatches
         )
     
     transforms['block2'] = merge_block(
@@ -193,7 +223,8 @@ def merge_resnet20(state_dict, a, b, transforms, concat_head=False):
         input_transform=transforms['conv1'], 
         intra_transform=transforms[f'block2.0'],
         output_transform=transforms['block2'],
-        shortcut=True
+        shortcut=True,
+        ignore_mismatches=ignore_mismatches
     )
     
     for i in range(1, 3):
@@ -202,7 +233,8 @@ def merge_resnet20(state_dict, a, b, transforms, concat_head=False):
             input_transform=transforms['block2'], 
             intra_transform=transforms[f'block2.{i}'],
             output_transform=transforms['block2'],
-            shortcut=False
+            shortcut=False,
+            ignore_mismatches=ignore_mismatches
         )
         
     transforms['block3'] = merge_block(
@@ -210,7 +242,8 @@ def merge_resnet20(state_dict, a, b, transforms, concat_head=False):
         input_transform=transforms['block2'], 
         intra_transform=transforms[f'block3.0'],
         output_transform=transforms['block3'],
-        shortcut=True
+        shortcut=True,
+        ignore_mismatches=ignore_mismatches
     )
     for i in range(1, 3):
         merge_block(
@@ -218,7 +251,8 @@ def merge_resnet20(state_dict, a, b, transforms, concat_head=False):
             input_transform=transforms['block3'], 
             intra_transform=transforms[f'block3.{i}'],
             output_transform=transforms['block3'],
-            shortcut=False
+            shortcut=False,
+            ignore_mismatches=ignore_mismatches
         )
         
     output_align_identity = torch.eye(a.linear.weight.shape[0], device=a.linear.weight.device)
@@ -228,7 +262,8 @@ def merge_resnet20(state_dict, a, b, transforms, concat_head=False):
         state_dict, 'linear', a.linear, b.linear, 
         transforms['block3'], transforms['linear'],
         recompute_output=False,
-        only_input_align=concat_head
+        only_input_align=concat_head,
+        ignore_mismatches=ignore_mismatches
     )
     
     return transforms
